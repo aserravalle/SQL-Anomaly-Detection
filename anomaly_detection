@@ -1,0 +1,198 @@
+/* ==============================================================================================
+StockData:
+
+Ticker     Period   Price
+---------- -------- -------------
+stock1     2020-03  13.00
+stock2     2020-03  7.00
+stock3     2020-05  38272.00
+stock4     2020-05  1.00
+stock5     2020-08  83.00
+ ============================================================================================== */
+DROP 
+  TABLE IF EXISTS TimeSeriesGrouped 
+SELECT 
+  Ticker, 
+  Period, 
+  CAST(Period + '-01' AS DATETIME) AS PeriodDate, 
+  CAST(
+    SUM(Price) AS DECIMAL(16, 2)
+  ) AS Price INTO TimeSeriesGrouped 
+FROM 
+  StockData 
+GROUP BY 
+  Ticker, 
+  Period 
+  /* ==============================================================================================
+    TimeSeriesGrouped:
+    
+    Ticker  Period      PeriodDate               Price
+    ------- ----------- ------------------------ ---------
+    stock1  2020-03     2020-03-01 00:00:00.000  13.00
+    stock2  2020-03     2020-03-01 00:00:00.000  7.00
+    stock3  2020-05     2020-05-01 00:00:00.000  38272.00
+    stock4  2020-05     2020-05-01 00:00:00.000  1.00
+    stock5  2020-08     2020-08-01 00:00:00.000  83.00
+  ============================================================================================== */
+ALTER TABLE 
+  TimeSeriesGrouped 
+ADD 
+  PctChange DECIMAL(10, 4) 
+UPDATE 
+  TimeSeriesGrouped 
+SET 
+  PctChange = CASE WHEN TS2.Price = 0 THEN 0.0 ELSE CASE WHEN (TS1.Price - TS2.Price) / TS2.Price <= -0.99 THEN -0.99 ELSE (TS1.Price - TS2.Price) / TS2.Price END END 
+FROM 
+  TimeSeriesGrouped AS TS1 
+  JOIN (
+    SELECT 
+      Ticker, 
+      Price, 
+      PeriodDate 
+    FROM 
+      TimeSeriesGrouped
+  ) AS TS2 --Same as TS1 with the date shifted one month
+  ON (
+    TS1.PeriodDate = DATEADD(month, 1, TS2.PeriodDate) 
+    AND TS1.Ticker = TS2.Ticker
+  ) 
+ALTER TABLE 
+  TimeSeriesGrouped 
+DROP 
+  COLUMN PeriodDate 
+ALTER TABLE 
+  TimeSeriesGrouped 
+ADD 
+  IsPctAnomaly INT -- Indicates anomalous values of PctChange
+UPDATE 
+  TimeSeriesGrouped 
+SET 
+  IsPctAnomaly = CASE WHEN NormalisedPctChange.StandardDeviationX = 0 THEN 0 -- Do not detect for missing StdDev
+  WHEN NormalisedPctChange.CountX < 5 THEN 0 -- Do not detect for stocks with low data count
+  WHEN ABS(
+    LOG(TimeSeriesGrouped.PctChange + 1) - NormalisedPctChange.MeanX
+  ) / NormalisedPctChange.StandardDeviationX > 1.96 THEN 1 -- Flag anomalous price values
+  ELSE 0 END 
+FROM 
+  TimeSeriesGrouped 
+  INNER JOIN (
+    SELECT 
+      TS.Ticker, 
+      COUNT(TS.LogPctChange) as CountX, 
+      AVG(TS.LogPctChange) as MeanX, 
+      STDEV(TS.LogPctChange) AS StandardDeviationX 
+    FROM 
+      (
+        SELECT 
+          Ticker, 
+          Period, 
+          LOG(PctChange + 1) LogPctChange 
+        FROM 
+          TimeSeriesGrouped
+      ) AS TS 
+    GROUP BY 
+      Ticker
+  ) AS NormalisedPctChange ON NormalisedPctChange.Ticker = TimeSeriesGrouped.Ticker 
+  /* ==============================================================================================
+	TimeSeriesGrouped:
+  
+    Ticker       Period   Price  PctChange IsPctAnomaly
+    ------------ -------- ------ --------- -----------
+    stock6       2019-08  11.00  NULL      0
+    stock6       2019-09  6.00   -0.4545   0
+    stock6       2019-10  4.00   -0.3333   0
+    stock6       2019-11  7.00   0.7500    0
+    stock6       2019-12  6.00   -0.1429   0
+    stock6       2020-01  2.00   -0.6667   0
+    stock6       2020-02  9.00   3.5000    1
+    ==============================================================================================*/
+ALTER TABLE 
+  TimeSeriesGrouped 
+ADD 
+  IsQuartileAnomaly INT 
+UPDATE 
+  TimeSeriesGrouped 
+SET 
+  IsQuartileAnomaly = CASE WHEN Price < MinIQR THEN 1 WHEN Price > MaxIQR THEN 1 ELSE 0 END 
+FROM 
+  TimeSeriesGrouped 
+  INNER JOIN (
+    SELECT 
+      QuartileTable.Ticker, 
+      MaxIQR = QuartileTable.Quartile75 + 1.5 * (
+        QuartileTable.Quartile75 - QuartileTable.Quartile25
+      ), 
+      MinIQR = QuartileTable.Quartile25 - 1.5 * (
+        QuartileTable.Quartile75 - QuartileTable.Quartile25
+      ) 
+    FROM 
+      (
+        SELECT 
+          Ticker, 
+          MAX(Price) Quartile75, 
+          MIN(Price) Quartile25 
+        FROM 
+          (
+            SELECT 
+              Period, 
+              Ticker, 
+              Price, 
+              NTILE(4) OVER (
+                PARTITION BY Ticker 
+                ORDER BY 
+                  Price
+              ) AS PriceQuartile 
+            FROM 
+              TimeSeriesGrouped
+          ) AS quartiles 
+        WHERE 
+          PriceQuartile IN (2, 3) 
+        GROUP BY 
+          Ticker
+      ) AS QuartileTable
+  ) AS qt ON qt.Ticker = TimeSeriesGrouped.Ticker 
+ALTER TABLE 
+  TimeSeriesGrouped 
+ADD 
+  IsPercentileAnomaly INT 
+UPDATE 
+  TimeSeriesGrouped 
+SET 
+  --SELECT TOP(100) TimeSeriesGrouped.Ticker, TimeSeriesGrouped.TimeSeriesGrouped.Period, TimeSeriesGrouped.Price, T.PricePercentiles, T.PriceCounts,
+  IsPercentileAnomaly = CASE WHEN T.PriceCounts >= 10 THEN CASE WHEN T.PricePercentiles <= 0.02 
+  OR T.PricePercentiles >= 0.98 THEN 1 ELSE 0 END ELSE 0 END 
+FROM 
+  TimeSeriesGrouped 
+  INNER JOIN (
+    SELECT 
+      Ticker, 
+      Period, 
+      PERCENT_RANK() OVER (
+        PARTITION BY Ticker 
+        ORDER BY 
+          Price
+      ) AS PricePercentiles, 
+      COUNT(Price) OVER (
+        PARTITION BY Ticker 
+        ORDER BY 
+          Price
+      ) AS PriceCounts 
+    FROM 
+      TimeSeriesGrouped
+  ) as T ON T.Ticker = TimeSeriesGrouped.Ticker 
+  AND T.Period = TimeSeriesGrouped.Period 
+  /* ==============================================================================================
+    TimeSeriesGrouped:
+    
+    Ticker      Period   Price  PctChange  IsPctAnomaly  IsQuartileAnomaly  IsPercentileAnomaly
+    ------------ -------- ------ ---------- ------------- ------------------ ----------------
+    stock7       2019-08  1.00   NULL       0             0                  1
+    stock7       2020-02  1.00   NULL       0             0                  1
+    stock7       2020-03  5.00   4.0000     0             0                  0
+    stock7       2020-04  2.00   -0.6000    0             0                  0
+    stock7       2020-05  33.00  15.5000    1             0                  0
+    stock7       2020-06  9.00   -0.7273    0             0                  0
+    stock7       2020-07  362.00 39.2222    1             1                  0
+    stock7       2020-08  32.00  -0.9116    1             0                  0
+    stock7       2020-09  93.00  1.9063     0             1                  0
+    ==============================================================================================*/
